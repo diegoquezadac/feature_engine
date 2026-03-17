@@ -16,6 +16,12 @@ def _key_to_str(key: Any) -> str:
     # numpy scalars (int64, float64 …) are not JSON-serialisable by default.
     if hasattr(key, "item"):
         key = key.item()
+    # pandas NA, float NaN, None → JSON null
+    try:
+        if pd.isna(key):
+            return "null"
+    except (TypeError, ValueError):
+        pass
     return json.dumps(key)
 
 
