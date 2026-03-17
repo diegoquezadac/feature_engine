@@ -1,6 +1,6 @@
 # feature_engine
 
-A lightweight **feature engine** for event-driven feature computation. Define features once, feed events one at a time with `update()` or replay a full dataset with `compute()`. Supports time-windowed aggregations, row-level filters, online serving (in-memory) and offline history (Parquet).
+A lightweight **feature engine** for event-driven feature computation. Define features once, feed events one at a time with `update()` or compute features across a full DataFrame with `compute()`. Supports time-windowed aggregations, row-level filters, online serving (in-memory) and offline history (Parquet).
 
 ## Installation
 
