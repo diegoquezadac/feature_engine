@@ -46,7 +46,7 @@ class FeatureStore:
         fs.register(avg_price)
 
         report = fs.run(df)
-        # df now has a new column "user__avg_price"
+        # df now has a new column "user:avg_price"
         # report → {"rows_processed": 6, "features_computed": 1, ...}
     """
 
@@ -95,7 +95,7 @@ class FeatureStore:
         """Process a full DataFrame in timestamp order (experimental mode).
 
         Modifies *df* in place by adding feature values as new columns named
-        ``"{entity}__{feature}"``. Offline records are flushed in 100 K-row
+        ``"{entity}:{feature}"``. Offline records are flushed in 100 K-row
         batches. Does not use the internal buffer.
 
         Args:

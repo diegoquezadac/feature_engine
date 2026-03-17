@@ -152,7 +152,7 @@ class Engine:
         works entirely on the supplied DataFrame, which must contain all rows
         upfront.  The DataFrame is sorted in place by timestamp and feature
         values are written onto it as new columns named
-        ``"{entity}__{feature}"`` — no copy is made.
+        ``"{entity}:{feature}"`` — no copy is made.
 
         Offline records are flushed to Parquet in batches of 100 K rows so IO
         is never a per-row bottleneck.
@@ -189,7 +189,7 @@ class Engine:
         input_cols = list(df.columns)
 
         feat_items = list(self._features.items())
-        col_names  = {fk: f"{feat.entity.name}__{feat.name}" for fk, feat in feat_items}
+        col_names  = {fk: f"{feat.entity.name}:{feat.name}" for fk, feat in feat_items}
 
         # Checkpoint paths (resolved once; None when checkpointing is disabled).
         _ckpt_meta   = os.path.join(checkpoint_dir, "meta.json")           if checkpoint_dir else None
