@@ -97,6 +97,8 @@ class Engine:
             entity_key = row[entity.key]
             entity_df = df[df[entity.key] == entity_key].copy()
             entity_df = self._apply_window(entity_df, feature, timestamp)
+            if feature.where is not None:
+                entity_df = entity_df[feature.where(entity_df)]
             value = feature.aggregation(entity_df)
 
             self.online.upsert(entity.name, entity_key, feature.name, value)

@@ -58,12 +58,16 @@ class Feature:
         window: Optional time window string (e.g., '30m', '2h', '7d').
                 When set, only rows within [timestamp - window, timestamp]
                 are passed to the aggregation function.
+        where: Optional row filter applied after windowing.  Receives the
+               entity DataFrame and must return a boolean Series.
+               Example: ``where=lambda g: g["price"] > 100``
     """
     name: str
     entity: Entity
     aggregation: str | Callable[[Any], Any]
     on: str | None = None
     window: str | None = None
+    where: Callable[[Any], Any] | None = None
 
     # Derived in __post_init__ — not part of the public constructor.
     columns: list[str] = field(init=False)
