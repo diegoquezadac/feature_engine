@@ -20,10 +20,18 @@ class FeatureStore:
     Online store: in-memory (always fast).
     Offline store: Parquet file (never grows unbounded in RAM).
 
-    Example — row-by-row (streaming) usage::
+    Two execution modes:
 
-        user = Entity("user", "user_id")
-        avg_price = Feature("avg_price", user, lambda g: g["price"].mean())
+    **Streaming** — ``step(row)``: process one event at a time. Each call
+    appends the row to an internal buffer and recomputes features over that
+    buffer. Use this when data arrives incrementally (e.g. a message queue).
+
+    **Experimental** — ``run(df)``: process a full DataFrame at once. No buffer
+    is used — the engine works directly on the supplied DataFrame, adds feature
+    columns onto it in place, and flushes all offline records in a single batch
+    write. Use this for offline experiments and historical replay.
+
+    Example — streaming::
 
         fs = FeatureStore(timestamp_col="ts")
         fs.register(avg_price)
@@ -32,14 +40,14 @@ class FeatureStore:
             features = fs.step(row)
             # {"user": {"avg_price": 120.5}}
 
-    Example — batch usage with a fixed dataset::
+    Example — experimental::
 
-        results = fs.run(df, id_col="attempt_id")
-        # {attempt_id: {"user": {"avg_price": ...}, ...}}
+        fs = FeatureStore(timestamp_col="ts")
+        fs.register(avg_price)
 
-    Example — batch with no id column (uses DataFrame index)::
-
-        results = fs.run(df)
+        report = fs.run(df)
+        # df now has a new column "user__avg_price"
+        # report → {"rows_processed": 6, "features_computed": 1, ...}
     """
 
     def __init__(
@@ -76,26 +84,22 @@ class FeatureStore:
     # Batch API
     # ------------------------------------------------------------------
 
-    def run(
-        self,
-        df: pd.DataFrame,
-        id_col: str | None = None,
-    ) -> dict[Any, dict[str, dict[str, Any]]]:
-        """Process a full DataFrame and return a per-row feature snapshot.
+    def run(self, df: pd.DataFrame) -> dict[str, Any]:
+        """Process a full DataFrame in timestamp order (experimental mode).
 
-        Rows are processed in ascending timestamp order.  Each feature is
-        computed once per unique entity key per timestamp (not once per row),
-        so this is faster than calling ``step`` in a loop.
+        Modifies *df* in place by adding feature values as new columns named
+        ``"{entity}__{feature}"``. All offline records are written in a single
+        batch at the end. Does not use the internal buffer.
 
         Args:
-            df: Input DataFrame.
-            id_col: Column that identifies each row in the output dict.
-                    When omitted the DataFrame index is used.
+            df: Input DataFrame. Must contain ``timestamp_col``. Modified in
+                place — feature columns are added directly onto it.
 
         Returns:
-            {id_value: {entity_name: {feature_name: value}}}
+            A summary report dict: rows_processed, features_computed,
+            records_written, elapsed_seconds, feature_columns.
         """
-        return self._engine.run(df, id_col)
+        return self._engine.run(df)
 
     # ------------------------------------------------------------------
     # Serving

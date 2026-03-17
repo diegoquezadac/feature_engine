@@ -5,6 +5,7 @@ aggregations, batch execution, and both online (latest) and offline
 (historical) feature serving.
 """
 
+import time
 import pandas as pd
 from datetime import datetime
 from typing import Any
@@ -79,6 +80,10 @@ class Engine:
             )
         self._validate_row(row)
 
+        # NOTE: The buffer grows indefinitely. A future improvement would be to
+        # periodically dump older rows to an optimised data file (e.g. Parquet
+        # or Arrow IPC) and reload only the rows that fall within the widest
+        # registered time window, rather than keeping every row in memory.
         self._buffer.append(row)
         timestamp = row.get(self.timestamp_col)
 
@@ -120,44 +125,86 @@ class Engine:
     # Batch API
     # ------------------------------------------------------------------
 
-    def run(
-        self,
-        df: pd.DataFrame,
-        id_col: str | None = None,
-    ) -> dict[Any, dict[str, dict[str, Any]]]:
-        """Process a full DataFrame (in timestamp order) and return a
-        per-row feature snapshot.
+    def run(self, df: pd.DataFrame) -> dict[str, Any]:
+        """Process a full DataFrame in timestamp order, adding computed features
+        as new columns directly on *df*.
 
-        Rows that share the same timestamp are batched together so each
-        feature is computed once per unique entity key per timestamp rather
-        than once per row — more efficient than calling ``step`` in a loop.
+        Unlike ``step()``, this method does **not** use the internal buffer — it
+        works entirely on the supplied DataFrame, which must contain all rows
+        upfront.  The DataFrame is sorted in place by timestamp and feature
+        values are written onto it as new columns named
+        ``"{entity}__{feature}"`` — no copy is made.
+
+        All offline records are collected and flushed to Parquet in a single
+        batch write at the end, so IO is not a per-row bottleneck.
 
         Args:
-            df: Input DataFrame.  Must contain ``timestamp_col``.
-            id_col: Column whose value identifies each row in the output.
-                    When omitted the DataFrame's index is used as the key.
+            df: Input DataFrame. Must contain ``timestamp_col``. Modified in
+                place — feature values are added as new columns.
 
         Returns:
-            {id_value: {entity_name: {feature_name: value}}} reflecting
-            the feature state at the moment each row was processed.
+            A summary report with execution statistics.
         """
         if self.timestamp_col not in df.columns:
             raise ValueError(
                 f"timestamp column '{self.timestamp_col}' not found in DataFrame columns: {list(df.columns)}"
             )
-        if id_col is not None and id_col not in df.columns:
-            raise ValueError(
-                f"id column '{id_col}' not found in DataFrame columns: {list(df.columns)}"
-            )
 
-        df_sorted = df.sort_values(self.timestamp_col).reset_index(drop=True)
-        results: dict[Any, dict[str, dict[str, Any]]] = {}
+        start = time.time()
+        df.sort_values(self.timestamp_col, inplace=True, ignore_index=True)
 
-        for idx, row in df_sorted.iterrows():
-            id_val = row[id_col] if id_col else idx
-            results[id_val] = self.step(row)
+        _BATCH_SIZE = 100_000
+        records: list[FeatureRecord] = []
 
-        return results
+        for i, row in df.iterrows():
+            timestamp = row[self.timestamp_col]
+
+            for feature in self._features.values():
+                entity = feature.entity
+
+                if entity.key not in df.columns:
+                    print(f"[warning] feature '{feature.name}' skipped: key '{entity.key}' not in DataFrame")
+                    continue
+
+                entity_key = row[entity.key]
+                entity_df = df[
+                    (df[entity.key] == entity_key) &
+                    (df[self.timestamp_col] <= timestamp)
+                ]
+                entity_df = self._apply_window(entity_df, feature, timestamp)
+                if feature.where is not None:
+                    entity_df = entity_df[feature.where(entity_df)]
+
+                value = feature.aggregation(entity_df)
+
+                self.online.upsert(entity.name, entity_key, feature.name, value)
+                df.at[i, f"{entity.name}__{feature.name}"] = value
+
+                records.append(FeatureRecord(
+                    entity_name=entity.name,
+                    entity_key=entity_key,
+                    feature_name=feature.name,
+                    value=value,
+                    timestamp=timestamp,
+                ))
+
+            if len(records) >= _BATCH_SIZE:
+                self.offline.batch_write(records)
+                records.clear()
+
+        if records:
+            self.offline.batch_write(records)
+
+        feature_cols = sorted({
+            f"{feat.entity.name}__{feat.name}" for feat in self._features.values()
+        })
+        return {
+            "rows_processed": len(df),
+            "features_computed": len(self._features),
+            "records_written": len(records),
+            "elapsed_seconds": round(time.time() - start, 4),
+            "feature_columns": feature_cols,
+        }
 
     # ------------------------------------------------------------------
     # Querying

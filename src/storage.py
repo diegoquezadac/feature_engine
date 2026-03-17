@@ -113,6 +113,28 @@ class OfflineStorage:
         combined.to_parquet(self.path, index=False)
         self._pending.clear()
 
+    def batch_write(self, records: list["FeatureRecord"]):
+        """Write a list of records to the Parquet file in a single IO operation.
+
+        Intended for experimental/batch mode where all records are known upfront
+        and IO should not become a row-by-row bottleneck.
+        """
+        if not records:
+            return
+        new_df = pd.DataFrame([{
+            "entity_name": r.entity_name,
+            "entity_key": _key_to_str(r.entity_key),
+            "feature_name": r.feature_name,
+            "value": r.value,
+            "timestamp": r.timestamp,
+        } for r in records])
+        if os.path.exists(self.path):
+            existing = pd.read_parquet(self.path)
+            combined = pd.concat([existing, new_df], ignore_index=True)
+        else:
+            combined = new_df
+        combined.to_parquet(self.path, index=False)
+
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
