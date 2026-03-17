@@ -20,6 +20,44 @@ The store maintains two backends:
 - **Online** — in-memory dict of the latest feature values per entity key. Fast lookups for real-time scoring.
 - **Offline** — Parquet file with the full history of every feature computation. Never grows unbounded in RAM.
 
+## Execution modes
+
+### `step(row)` — streaming
+
+Process one event at a time. Each call appends the row to an internal buffer and recomputes features over that buffer. Use this when data arrives incrementally (e.g. from a message queue or a real-time stream).
+
+```python
+row = {"user_id": 1, "store_id": 10, "price": 120, "card": "A", "ts": datetime(...)}
+
+features = fs.step(row)
+# {
+#   "user":  {"avg_price": 120.0, "tx_count": 1, "cards_30m": 1},
+#   "store": {"total_revenue": 120}
+# }
+```
+
+Useful for scoring a new event in real time — call `step()`, inspect the returned features, make a decision.
+
+> **Note:** The buffer grows indefinitely. A future improvement is to periodically dump older rows to an optimised data file and reload only the rows within the widest registered window.
+
+### `run(df)` — experimental
+
+Process a full DataFrame at once. The engine works directly on the supplied DataFrame — no internal buffer is used and no copy is made. Feature values are written onto `df` in place as new columns named `"{entity}__{feature}"`. All offline records are written to Parquet in a single batch at the end, so IO is not a per-row bottleneck.
+
+```python
+report = fs.run(df)
+# df now has new columns: "user__avg_price", "user__tx_count", "store__total_revenue", ...
+# report → {
+#   "rows_processed": 6,
+#   "features_computed": 7,
+#   "records_written": 36,
+#   "elapsed_seconds": 0.04,
+#   "feature_columns": ["store__avg_price", "store__total_revenue", "user__avg_price", ...]
+# }
+```
+
+Use this for offline experiments, historical replay, and dataset enrichment.
+
 ## Quick start
 
 ```python
@@ -41,44 +79,16 @@ fs.register(avg_price)
 fs.register(tx_count)
 fs.register(cards_30m)
 fs.register(store_rev)
-```
 
-## Usage
-
-### `step(row)` — streaming / real-time
-
-Process one event at a time. Each call updates both stores and returns the current feature values for every entity found in the row.
-
-```python
-row = {"user_id": 1, "store_id": 10, "price": 120, "card": "A", "ts": datetime(...)}
-
+# 4a. Streaming mode — one row at a time
 features = fs.step(row)
-# {
-#   "user":  {"avg_price": 120.0, "tx_count": 1, "cards_30m": 1},
-#   "store": {"total_revenue": 120}
-# }
+
+# 4b. Experimental mode — full DataFrame, enriched in place
+report = fs.run(df)
+# df["user__avg_price"], df["user__tx_count"], df["store__total_revenue"] are now populated
 ```
 
-Useful for scoring a new event in real time — call `step()`, inspect the returned features, make a decision.
-
-### `run(df, id_col=None)` — batch
-
-Replay a full DataFrame in timestamp order. Returns a per-row feature snapshot reflecting the state at the moment each row was processed.
-
-```python
-results = fs.run(df, id_col="attempt_id")
-# {
-#   1001: {"user": {"avg_price": 100.0, ...}, "store": {...}},
-#   1002: {"user": {"avg_price": 125.0, ...}, "store": {...}},
-#   ...
-# }
-```
-
-If `id_col` is omitted, the DataFrame index is used as the key.
-
-`run()` is equivalent to calling `step()` in a loop over the sorted DataFrame.
-
-### Querying the stores
+## Querying the stores
 
 ```python
 # Latest values (online store)
@@ -165,9 +175,9 @@ The predicate receives the full entity DataFrame (already windowed) and has acce
 The store validates inputs before doing any work:
 
 - **`step(row)`** — raises `ValueError` if the timestamp column or any declared feature column is missing from the row dict.
-- **`run(df)`** — raises `ValueError` if the timestamp column or `id_col` is missing from the DataFrame columns.
+- **`run(df)`** — raises `ValueError` if the timestamp column is missing from the DataFrame columns.
 - **`Feature(...)`** — raises `ValueError` at construction if the aggregation name is unknown, if a required `on` column is missing, or if the `window` string is not a valid format.
-- A `[warning]` is printed (but execution continues) when an entity key column is missing from a row — the feature is skipped for that row.
+- A `[warning]` is printed (but execution continues) when an entity key column is missing from a row or DataFrame.
 
 ## Project structure
 
@@ -176,7 +186,7 @@ src/
   entity.py        # Entity definition
   feature.py       # Feature definition, built-in aggregation registry, window parsing
   feature_store.py # Public interface (thin wrapper over Engine)
-  engine.py        # Core computation: step(), run(), serving
+  engine.py        # Core computation: step() (streaming), run() (experimental)
   storage.py       # OnlineStorage (in-memory) + OfflineStorage (Parquet)
 main.py            # Usage examples
 ```
@@ -190,4 +200,4 @@ FeatureStore(
 )
 ```
 
-The offline Parquet file is created lazily on the first flush. Records are buffered in memory (up to 500 at a time) and written in batches. Call `fs.flush()` to force-write any pending records immediately.
+The offline Parquet file is created lazily on the first write. In streaming mode, records are buffered in memory (up to 500 at a time) and written in batches; call `fs.flush()` to force-write any pending records. In experimental mode, all records are written in a single batch at the end of `run()`.
