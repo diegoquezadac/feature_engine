@@ -53,7 +53,7 @@ class FeatureStore:
     def __init__(
         self,
         timestamp_col: str = "ts",
-        offline_path: str = "offline.parquet",
+        offline_path: str = "offline_store",
     ):
         self._engine = Engine(timestamp_col=timestamp_col, offline_path=offline_path)
 

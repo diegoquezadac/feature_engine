@@ -71,6 +71,9 @@ class Feature:
 
     # Derived in __post_init__ — not part of the public constructor.
     columns: list[str] = field(init=False)
+    # Original built-in aggregation name, preserved for the vectorized engine path.
+    # None for custom callables.
+    _agg_name: str | None = field(init=False)
 
     def __post_init__(self):
         if isinstance(self.aggregation, str):
@@ -86,9 +89,11 @@ class Feature:
                     f"Aggregation '{agg_name}' requires an 'on' column."
                 )
             self.columns = [self.on] if self.on else []
+            self._agg_name = agg_name
             self.aggregation = _AGG_REGISTRY[agg_name](self.on)
         else:
             self.columns = [self.on] if self.on else []
+            self._agg_name = None
 
         if self.window is not None:
             parse_window(self.window)

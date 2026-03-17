@@ -67,12 +67,15 @@ class OnlineStorage:
 class OfflineStorage:
     """Parquet-backed storage for the full feature history.
 
-    Records are accumulated in a small in-memory buffer and flushed to disk
-    automatically when the buffer is full, or on-demand via ``flush()``.
-    Reads always flush first so the Parquet file is always up-to-date.
+    Uses an **append-only directory layout**: every flush writes a new
+    ``part_NNNNNNNN.parquet`` file inside ``path/``.  No existing data is
+    ever re-read on write — each flush is O(batch_size), not O(total_rows).
 
-    The file is created lazily on the first flush.  Pass ``path`` to control
-    where it lives — useful for keeping test runs or experiments isolated.
+    ``pd.read_parquet`` transparently combines all part files when reading,
+    and pyarrow's predicate pushdown still applies per-file.
+
+    The directory is created lazily on the first flush.  Pass ``path`` to
+    control where it lives — useful for isolating test runs.
 
     Designed so that swapping the backend (e.g. to S3, Delta Lake, Lance …)
     only requires changing this class.
@@ -80,9 +83,23 @@ class OfflineStorage:
 
     _FLUSH_THRESHOLD = 500  # records to buffer before an automatic flush
 
-    def __init__(self, path: str = "offline.parquet"):
+    def __init__(self, path: str = "offline_store"):
         self.path = path
         self._pending: list[dict] = []
+        self._part_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _next_part_path(self) -> str:
+        p = os.path.join(self.path, f"part_{self._part_count:08d}.parquet")
+        self._part_count += 1
+        return p
+
+    @staticmethod
+    def _records_to_df(rows: list[dict]) -> "pd.DataFrame":
+        return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
     # Writes
@@ -101,39 +118,29 @@ class OfflineStorage:
             self.flush()
 
     def flush(self):
-        """Write all pending records to the Parquet file."""
+        """Write buffered records as a new part file — O(pending), no re-read."""
         if not self._pending:
             return
-        new_df = pd.DataFrame(self._pending)
-        if os.path.exists(self.path):
-            existing = pd.read_parquet(self.path)
-            combined = pd.concat([existing, new_df], ignore_index=True)
-        else:
-            combined = new_df
-        combined.to_parquet(self.path, index=False)
+        os.makedirs(self.path, exist_ok=True)
+        self._records_to_df(self._pending).to_parquet(self._next_part_path(), index=False)
         self._pending.clear()
 
     def batch_write(self, records: list["FeatureRecord"]):
-        """Write a list of records to the Parquet file in a single IO operation.
+        """Write a batch of records as a single new part file — O(batch_size), no re-read.
 
-        Intended for experimental/batch mode where all records are known upfront
-        and IO should not become a row-by-row bottleneck.
+        Intended for experimental/batch mode where all records are known upfront.
         """
         if not records:
             return
-        new_df = pd.DataFrame([{
+        os.makedirs(self.path, exist_ok=True)
+        rows = [{
             "entity_name": r.entity_name,
             "entity_key": _key_to_str(r.entity_key),
             "feature_name": r.feature_name,
             "value": r.value,
             "timestamp": r.timestamp,
-        } for r in records])
-        if os.path.exists(self.path):
-            existing = pd.read_parquet(self.path)
-            combined = pd.concat([existing, new_df], ignore_index=True)
-        else:
-            combined = new_df
-        combined.to_parquet(self.path, index=False)
+        } for r in records]
+        self._records_to_df(rows).to_parquet(self._next_part_path(), index=False)
 
     # ------------------------------------------------------------------
     # Reads

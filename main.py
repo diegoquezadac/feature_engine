@@ -1,7 +1,7 @@
 """Example usage of the local feature store."""
 
 import logging
-import os
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -31,10 +31,9 @@ def make_synthetic_df(n: int = 1_000, seed: int = 42) -> pd.DataFrame:
 
 
 def main():
-    if os.path.exists("offline.parquet"):
-        os.remove("offline.parquet")
+    shutil.rmtree("offline_store", ignore_errors=True)
 
-    df = make_synthetic_df(n=1_000)
+    df = make_synthetic_df(n=1_000_000)
 
     # ---------------------------------------------------------------
     # Define entities
@@ -67,7 +66,7 @@ def main():
               user_tx_store1, store_avg_price, store_total_rev]:
         fs.register(f)
 
-    report = fs.run(df, verbose=True, log_every=100)
+    report = fs.run(df, verbose=True, log_every=100_000)
     print("\nReport:", report)
 
     print("\nFirst 5 rows with feature columns:")
@@ -85,8 +84,7 @@ def main():
     print("EXAMPLE 2 — step(row)  — streaming mode (first 5 rows)")
     print("=" * 60)
 
-    if os.path.exists("offline.parquet"):
-        os.remove("offline.parquet")
+    shutil.rmtree("offline_store", ignore_errors=True)
 
     fs2 = FeatureStore(timestamp_col="ts")
     for f in [user_avg_price, user_tx_count, user_cards_2d]:

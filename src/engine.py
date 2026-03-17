@@ -7,6 +7,7 @@ aggregations, batch execution, and both online (latest) and offline
 
 import time
 import logging
+import numpy as np
 import pandas as pd
 from datetime import datetime
 from typing import Any
@@ -16,6 +17,11 @@ from src.feature import Feature, parse_window
 from src.storage import OnlineStorage, OfflineStorage, FeatureRecord
 
 logger = logging.getLogger(__name__)
+
+# Aggregations that can be computed for all rows at once via pandas vectorised ops.
+# Requires: built-in aggregation name, no time window.
+# `where` filters are handled via NaN masking so they don't block this path.
+_VECTORIZABLE_AGGS = frozenset({"mean", "sum", "count", "min", "max", "std", "nunique"})
 
 
 # ---------------------------------------------------------------------------
@@ -160,134 +166,292 @@ class Engine:
 
         start = time.perf_counter()
         df.sort_values(self.timestamp_col, inplace=True, ignore_index=True)
+        n_rows = len(df)
+        input_cols = list(df.columns)
+
+        feat_items = list(self._features.items())
+        col_names  = {fk: f"{feat.entity.name}__{feat.name}" for fk, feat in feat_items}
+
+        # Split features into two paths:
+        #   fast — vectorised pandas ops over the whole df at once (no Python loop)
+        #   slow — row-by-row with searchsorted (needed for time-windowed or custom aggs)
+        fast_feats = [
+            (fk, feat) for fk, feat in feat_items
+            if feat._agg_name in _VECTORIZABLE_AGGS and feat.window is None
+        ]
+        slow_feats = [
+            (fk, feat) for fk, feat in feat_items
+            if not (feat._agg_name in _VECTORIZABLE_AGGS and feat.window is None)
+        ]
+
+        if verbose:
+            logger.info(
+                "[run] %d fast features (vectorised), %d slow features (row-by-row)",
+                len(fast_feats), len(slow_feats),
+            )
+
+        # feature_values: col_name -> numpy array (fast) or list (slow)
+        feature_values: dict[str, Any] = {}
 
         _BATCH_SIZE = 100_000
         records: list[FeatureRecord] = []
         total_records_written = 0
 
-        # Timing accumulators (only populated when verbose=True).
         _t: dict[str, float] = {
-            "filter": 0.0,   # boolean mask: entity key + timestamp
-            "window": 0.0,   # _apply_window()
-            "where": 0.0,    # feature.where predicate
-            "agg": 0.0,      # feature.aggregation()
-            "online": 0.0,   # online store upsert
-            "df_write": 0.0, # df.at[] cell write
-            "offline_io": 0.0, # batch_write() calls
+            "vectorized": 0.0,   # fast path: _compute_vectorized()
+            "records":    0.0,   # fast path: online upsert + FeatureRecord creation
+            "slice":      0.0,   # slow path: searchsorted + DataFrame build
+            "where":      0.0,   # slow path: where predicate
+            "agg":        0.0,   # slow path: aggregation
+            "online":     0.0,   # slow path: online store upsert
+            "offline_io": 0.0,   # Parquet writes (both paths)
         }
 
-        n_rows = len(df)
+        def _flush(recs: list) -> None:
+            if verbose:
+                _t0 = time.perf_counter()
+            self.offline.batch_write(recs)
+            if verbose:
+                _t["offline_io"] += time.perf_counter() - _t0
 
-        for i, row in df.iterrows():
-            timestamp = row[self.timestamp_col]
+        # ----------------------------------------------------------------
+        # Fast path — one vectorised call per feature, no row loop
+        # ----------------------------------------------------------------
+        for fk, feat in fast_feats:
+            col_name = col_names[fk]
+            ek = feat.entity.key
 
-            for feature in self._features.values():
-                entity = feature.entity
+            if ek not in df.columns:
+                logger.warning("feature '%s' skipped: key '%s' not in DataFrame", feat.name, ek)
+                continue
 
-                if entity.key not in df.columns:
-                    logger.warning("feature '%s' skipped: key '%s' not in DataFrame", feature.name, entity.key)
-                    continue
+            if verbose:
+                _t0 = time.perf_counter()
+            values = self._compute_vectorized(df, feat)
+            if verbose:
+                _t["vectorized"] += time.perf_counter() - _t0
 
-                entity_key = row[entity.key]
+            feature_values[col_name] = values
 
-                if verbose:
-                    _t0 = time.perf_counter()
-                entity_df = df[
-                    (df[entity.key] == entity_key) &
-                    (df[self.timestamp_col] <= timestamp)
-                ]
-                if verbose:
-                    _t["filter"] += time.perf_counter() - _t0
+            if verbose:
+                _t0 = time.perf_counter()
 
-                if verbose:
-                    _t0 = time.perf_counter()
-                entity_df = self._apply_window(entity_df, feature, timestamp)
-                if verbose:
-                    _t["window"] += time.perf_counter() - _t0
+            # Online store: last value per entity key (df is timestamp-sorted).
+            val_series = pd.Series(values, index=df.index)
+            for key_val, last_val in val_series.groupby(df[ek]).last().items():
+                if hasattr(key_val, "item"):
+                    key_val = key_val.item()
+                self.online.upsert(feat.entity.name, key_val, feat.name, last_val)
 
-                if feature.where is not None:
-                    if verbose:
-                        _t0 = time.perf_counter()
-                    entity_df = entity_df[feature.where(entity_df)]
-                    if verbose:
-                        _t["where"] += time.perf_counter() - _t0
+            # FeatureRecords — one per row, no computation.
+            new_recs = [
+                FeatureRecord(
+                    entity_name=feat.entity.name,
+                    entity_key=ek_v.item() if hasattr(ek_v, "item") else ek_v,
+                    feature_name=feat.name,
+                    value=val,
+                    timestamp=ts,
+                )
+                for ek_v, ts, val in zip(df[ek], df[self.timestamp_col], values)
+            ]
+            records.extend(new_recs)
 
-                if verbose:
-                    _t0 = time.perf_counter()
-                value = feature.aggregation(entity_df)
-                if verbose:
-                    _t["agg"] += time.perf_counter() - _t0
-
-                if verbose:
-                    _t0 = time.perf_counter()
-                self.online.upsert(entity.name, entity_key, feature.name, value)
-                if verbose:
-                    _t["online"] += time.perf_counter() - _t0
-
-                if verbose:
-                    _t0 = time.perf_counter()
-                df.at[i, f"{entity.name}__{feature.name}"] = value
-                if verbose:
-                    _t["df_write"] += time.perf_counter() - _t0
-
-                records.append(FeatureRecord(
-                    entity_name=entity.name,
-                    entity_key=entity_key,
-                    feature_name=feature.name,
-                    value=value,
-                    timestamp=timestamp,
-                ))
+            if verbose:
+                _t["records"] += time.perf_counter() - _t0
 
             if len(records) >= _BATCH_SIZE:
-                if verbose:
-                    _t0 = time.perf_counter()
-                self.offline.batch_write(records)
-                if verbose:
-                    _t["offline_io"] += time.perf_counter() - _t0
+                _flush(records)
                 total_records_written += len(records)
                 records.clear()
 
-            if verbose and (i + 1) % log_every == 0:
-                elapsed = time.perf_counter() - start
-                rows_s = (i + 1) / elapsed
-                logger.info(
-                    "[run] %d/%d rows (%.0f rows/s) | filter=%.3fs window=%.3fs "
-                    "where=%.3fs agg=%.3fs online=%.3fs df_write=%.3fs offline_io=%.3fs",
-                    i + 1, n_rows, rows_s,
-                    _t["filter"], _t["window"], _t["where"],
-                    _t["agg"], _t["online"], _t["df_write"], _t["offline_io"],
-                )
+        if verbose and fast_feats:
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "[run] fast path done in %.3fs (%.0f rows/s equivalent) | "
+                "vectorized=%.3fs records=%.3fs offline_io=%.3fs",
+                elapsed, n_rows / elapsed,
+                _t["vectorized"], _t["records"], _t["offline_io"],
+            )
 
-        if records:
+        # ----------------------------------------------------------------
+        # Slow path — row-by-row with searchsorted, only for slow_feats
+        # ----------------------------------------------------------------
+        if slow_feats:
+            # Build per-entity groups only for entity key cols used by slow features.
+            slow_key_cols = {
+                feat.entity.key for _, feat in slow_feats
+                if feat.entity.key in df.columns
+            }
             if verbose:
                 _t0 = time.perf_counter()
-            self.offline.batch_write(records)
+            groups: dict[str, dict[Any, tuple[pd.DatetimeIndex, dict[str, np.ndarray]]]] = {}
+            for key_col in slow_key_cols:
+                groups[key_col] = {}
+                for key_val, grp in df.groupby(key_col, sort=False):
+                    if hasattr(key_val, "item"):
+                        key_val = key_val.item()
+                    groups[key_col][key_val] = (
+                        pd.DatetimeIndex(grp[self.timestamp_col]),
+                        {col: grp[col].to_numpy() for col in input_cols},
+                    )
             if verbose:
-                _t["offline_io"] += time.perf_counter() - _t0
+                logger.info("[run] slow-path groupby done in %.3fs", time.perf_counter() - _t0)
+
+            windows = {
+                fk: parse_window(feat.window) if feat.window else None
+                for fk, feat in slow_feats
+            }
+            for fk, feat in slow_feats:
+                feature_values[col_names[fk]] = [None] * n_rows
+
+            for i, row in df.iterrows():
+                timestamp = row[self.timestamp_col]
+
+                for feat_key, feature in slow_feats:
+                    entity   = feature.entity
+                    col_name = col_names[feat_key]
+
+                    if entity.key not in groups:
+                        logger.warning("feature '%s' skipped: key '%s' not in DataFrame", feature.name, entity.key)
+                        continue
+
+                    entity_key = row[entity.key]
+                    if hasattr(entity_key, "item"):
+                        entity_key = entity_key.item()
+
+                    ts_idx, arrays = groups[entity.key][entity_key]
+
+                    if verbose:
+                        _t0 = time.perf_counter()
+                    pos        = ts_idx.searchsorted(timestamp, side="right")
+                    window_td  = windows[feat_key]
+                    start_pos  = (
+                        ts_idx.searchsorted(timestamp - window_td, side="left")
+                        if window_td is not None else 0
+                    )
+                    s = slice(start_pos, pos)
+                    if feature.where is not None:
+                        entity_df = pd.DataFrame({col: arrays[col][s] for col in input_cols})
+                    elif feature.columns:
+                        entity_df = pd.DataFrame({col: arrays[col][s] for col in feature.columns})
+                    else:
+                        entity_df = pd.DataFrame(index=range(pos - start_pos))
+                    if verbose:
+                        _t["slice"] += time.perf_counter() - _t0
+
+                    if feature.where is not None:
+                        if verbose:
+                            _t0 = time.perf_counter()
+                        entity_df = entity_df[feature.where(entity_df)]
+                        if verbose:
+                            _t["where"] += time.perf_counter() - _t0
+
+                    if verbose:
+                        _t0 = time.perf_counter()
+                    value = feature.aggregation(entity_df)
+                    if verbose:
+                        _t["agg"] += time.perf_counter() - _t0
+
+                    if verbose:
+                        _t0 = time.perf_counter()
+                    self.online.upsert(entity.name, entity_key, feature.name, value)
+                    if verbose:
+                        _t["online"] += time.perf_counter() - _t0
+
+                    feature_values[col_name][i] = value
+                    records.append(FeatureRecord(
+                        entity_name=entity.name,
+                        entity_key=entity_key,
+                        feature_name=feature.name,
+                        value=value,
+                        timestamp=timestamp,
+                    ))
+
+                if len(records) >= _BATCH_SIZE:
+                    _flush(records)
+                    total_records_written += len(records)
+                    records.clear()
+
+                if verbose and (i + 1) % log_every == 0:
+                    elapsed = time.perf_counter() - start
+                    logger.info(
+                        "[run] slow %d/%d rows (%.0f rows/s) | "
+                        "slice=%.3fs where=%.3fs agg=%.3fs online=%.3fs offline_io=%.3fs",
+                        i + 1, n_rows, (i + 1) / elapsed,
+                        _t["slice"], _t["where"], _t["agg"], _t["online"], _t["offline_io"],
+                    )
+
+        # Assign all feature columns to df at once.
+        for col, values in feature_values.items():
+            df[col] = values
+
+        if records:
+            _flush(records)
             total_records_written += len(records)
 
         elapsed = time.perf_counter() - start
 
         if verbose:
             total_instrumented = sum(_t.values()) or 1.0
-            logger.info(
-                "[run] DONE — %d rows in %.3fs (%.0f rows/s)",
-                n_rows, elapsed, n_rows / elapsed,
-            )
+            logger.info("[run] DONE — %d rows in %.3fs (%.0f rows/s)", n_rows, elapsed, n_rows / elapsed)
             logger.info("[run] Timing breakdown:")
             for phase, t in _t.items():
-                logger.info("  %-12s  %7.3fs  (%5.1f%%)", phase, t, 100 * t / total_instrumented)
+                logger.info("  %-14s  %7.3fs  (%5.1f%%)", phase, t, 100 * t / total_instrumented)
 
-        feature_cols = sorted({
-            f"{feat.entity.name}__{feat.name}" for feat in self._features.values()
-        })
+        feature_cols = sorted(col_names.values())
         return {
-            "rows_processed": n_rows,
+            "rows_processed":   n_rows,
             "features_computed": len(self._features),
-            "records_written": total_records_written,
-            "elapsed_seconds": round(elapsed, 4),
-            "feature_columns": feature_cols,
+            "fast_features":    len(fast_feats),
+            "slow_features":    len(slow_feats),
+            "records_written":  total_records_written,
+            "elapsed_seconds":  round(elapsed, 4),
+            "feature_columns":  feature_cols,
         }
+
+    # ------------------------------------------------------------------
+    # Vectorised helper
+    # ------------------------------------------------------------------
+
+    def _compute_vectorized(self, df: pd.DataFrame, feature: Feature) -> np.ndarray:
+        """Compute feature values for every row at once using pandas vectorised ops.
+
+        Returns a numpy array aligned with df's integer index (0 … n-1).
+
+        Conditions for calling this:
+          - feature._agg_name is in _VECTORIZABLE_AGGS
+          - feature.window is None
+          - feature.where may or may not be set (handled via NaN masking)
+        """
+        ek  = feature.entity.key
+        agg = feature._agg_name
+        on  = feature.on
+
+        if feature.where is not None:
+            # Apply the predicate to the full df — it's a row-wise boolean comparison
+            # so it produces the same mask regardless of whether it sees one entity or all.
+            mask = feature.where(df)
+            if agg == "count":
+                # Cumulative count of matching rows per entity key.
+                return mask.astype(int).groupby(df[ek]).cumsum().to_numpy()
+            else:
+                # Zero out non-matching rows as NaN; expanding agg skips NaN.
+                data = df[on].where(mask, other=np.nan)
+                result = getattr(data.groupby(df[ek]).expanding(), agg)()
+                return result.droplevel(0).sort_index().to_numpy()
+
+        if agg == "nunique":
+            # For each row, count distinct (entity_key, value) pairs seen so far.
+            # Mark first occurrence of each pair → cumsum within entity = expanding nunique.
+            is_first = (~df.duplicated(subset=[ek, on], keep="first")).astype(int)
+            return is_first.groupby(df[ek]).cumsum().to_numpy()
+
+        if agg == "count":
+            return (df.groupby(ek).cumcount() + 1).to_numpy()
+
+        # mean, sum, min, max, std — expanding window
+        result = getattr(df.groupby(ek)[on].expanding(), agg)()
+        return result.droplevel(0).sort_index().to_numpy()
 
     # ------------------------------------------------------------------
     # Querying
