@@ -10,6 +10,22 @@ from src.entity import Entity
 
 _WINDOW_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 
+# Built-in aggregations. Each value is a factory: col -> (DataFrame -> value).
+_AGG_REGISTRY: dict[str, Callable] = {
+    "mean":    lambda col: lambda g: g[col].mean(),
+    "sum":     lambda col: lambda g: g[col].sum(),
+    "count":   lambda _: lambda g: len(g),
+    "nunique": lambda col: lambda g: g[col].nunique(),
+    "min":     lambda col: lambda g: g[col].min(),
+    "max":     lambda col: lambda g: g[col].max(),
+    "std":     lambda col: lambda g: g[col].std(),
+    "first":   lambda col: lambda g: g[col].iloc[0] if len(g) else None,
+    "last":    lambda col: lambda g: g[col].iloc[-1] if len(g) else None,
+}
+
+# Built-ins that operate on the whole group, not a specific column.
+_AGG_NO_COL = {"count"}
+
 
 def parse_window(window: str) -> timedelta:
     """Parse a window string like '30m', '2h', '7d' into a timedelta.
@@ -31,23 +47,44 @@ class Feature:
     """A feature computed from an aggregation function.
 
     Args:
-        name: Feature name (e.g., 'avg_price')
-        entity: The entity this feature belongs to
-        aggregation: Function that takes a DataFrame group and returns a value.
-                     Example: lambda df: df["price"].mean()
-        columns: Column names the aggregation reads. Used for upfront validation.
-                 Pass [] for aggregations that only need the row count (e.g. len(g)).
+        name: Feature name (e.g., 'avg_price').
+        entity: The entity this feature belongs to.
+        aggregation: Either a built-in name ('mean', 'sum', 'count', 'nunique',
+                     'min', 'max', 'std', 'first', 'last') or a custom callable
+                     ``(DataFrame) -> value``.
+        on: Column the aggregation reads. Required for all built-ins except
+            'count'. For custom callables, used to auto-populate ``columns``
+            for validation; omit if the callable needs no columns.
         window: Optional time window string (e.g., '30m', '2h', '7d').
                 When set, only rows within [timestamp - window, timestamp]
                 are passed to the aggregation function.
-                Example: Feature("distinct_cards_30m", user, lambda g: g["card"].nunique(), ["card"], "30m")
     """
     name: str
     entity: Entity
-    aggregation: Callable[[Any], Any]
-    columns: list[str]
-    window: str | None = field(default=None)
+    aggregation: str | Callable[[Any], Any]
+    on: str | None = None
+    window: str | None = None
+
+    # Derived in __post_init__ — not part of the public constructor.
+    columns: list[str] = field(init=False)
 
     def __post_init__(self):
+        if isinstance(self.aggregation, str):
+            agg_name = self.aggregation
+            if agg_name not in _AGG_REGISTRY:
+                raise ValueError(
+                    f"Unknown aggregation '{agg_name}'. "
+                    f"Available: {sorted(_AGG_REGISTRY)}. "
+                    f"Pass a callable for custom logic."
+                )
+            if agg_name not in _AGG_NO_COL and self.on is None:
+                raise ValueError(
+                    f"Aggregation '{agg_name}' requires an 'on' column."
+                )
+            self.columns = [self.on] if self.on else []
+            self.aggregation = _AGG_REGISTRY[agg_name](self.on)
+        else:
+            self.columns = [self.on] if self.on else []
+
         if self.window is not None:
-            parse_window(self.window)  # raises ValueError on invalid format
+            parse_window(self.window)

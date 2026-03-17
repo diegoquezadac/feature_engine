@@ -7,6 +7,7 @@ from datetime import datetime
 from src import Entity, Feature, FeatureStore
 
 
+
 def main():
     # Clean up any leftover Parquet file from a previous run.
     if os.path.exists("offline.parquet"):
@@ -39,14 +40,13 @@ def main():
     # ---------------------------------------------------------------
     # Define features  (some with time windows)
     # ---------------------------------------------------------------
-    user_avg_price   = Feature("avg_price",   user, lambda g: g["price"].mean(), ["price"])
-    user_total_spent = Feature("total_spent", user, lambda g: g["price"].sum(),  ["price"])
-    user_tx_count    = Feature("tx_count",    user, lambda g: len(g),            [])
-    user_cards_2d    = Feature("distinct_cards_2d", user,
-                               lambda g: g["card"].nunique(), ["card"], "2d")
+    user_avg_price   = Feature("avg_price",          user,  "mean",    on="price")
+    user_total_spent = Feature("total_spent",         user,  "sum",     on="price")
+    user_tx_count    = Feature("tx_count",            user,  "count")
+    user_cards_2d    = Feature("distinct_cards_2d",   user,  "nunique", on="card", window="2d")
 
-    store_avg_price = Feature("avg_price",     store, lambda g: g["price"].mean(), ["price"])
-    store_total_rev = Feature("total_revenue", store, lambda g: g["price"].sum(),  ["price"])
+    store_avg_price  = Feature("avg_price",           store, "mean",    on="price")
+    store_total_rev  = Feature("total_revenue",        store, "sum",     on="price")
 
     # ---------------------------------------------------------------
     # Example 1: run() — batch processing, one shot
