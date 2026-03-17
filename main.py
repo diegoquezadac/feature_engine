@@ -1,4 +1,4 @@
-"""Example usage of the local feature store."""
+"""Example usage of the feature engine."""
 
 import logging
 import shutil
@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 
-from src import Entity, Feature, FeatureStore
+from src import Entity, Feature, FeatureEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,44 +55,44 @@ def main():
     store_total_rev  = Feature("total_revenue",        store, "sum",     on="price")
 
     # ---------------------------------------------------------------
-    # Example 1: run() — experimental mode  (verbose=True to see timings)
+    # Example 1: compute() — batch mode  (verbose=True to see timings)
     # ---------------------------------------------------------------
     print("=" * 60)
-    print("EXAMPLE 1 — run(df)  — experimental mode")
+    print("EXAMPLE 1 — compute(df)  — batch mode")
     print("=" * 60)
 
-    fs = FeatureStore(timestamp_col="ts")
+    fe = FeatureEngine(timestamp_col="ts")
     for f in [user_avg_price, user_total_spent, user_tx_count, user_cards_2d,
               user_tx_store1, store_avg_price, store_total_rev]:
-        fs.register(f)
+        fe.register(f)
 
-    report = fs.run(df, verbose=True, log_every=100_000)
+    report = fe.compute(df, verbose=True, log_every=100_000)
     print("\nReport:", report)
 
     print("\nFirst 5 rows with feature columns:")
     feature_cols = ["attempt_id", "user_id", "store_id", "ts"] + report["feature_columns"]
     print(df[feature_cols].head().to_string(index=False))
 
-    print("\n--- Online features after run() ---")
-    print(f"  User 1:   {fs.get_online_features('user', user_id=1)}")
-    print(f"  Store 1:  {fs.get_online_features('store', store_id=1)}")
+    print("\n--- Online features after compute() ---")
+    print(f"  User 1:   {fe.get_online_features('user', user_id=1)}")
+    print(f"  Store 1:  {fe.get_online_features('store', store_id=1)}")
 
     # ---------------------------------------------------------------
-    # Example 2: step() — streaming mode
+    # Example 2: update() — streaming mode
     # ---------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("EXAMPLE 2 — step(row)  — streaming mode (first 5 rows)")
+    print("EXAMPLE 2 — update(row)  — streaming mode (first 5 rows)")
     print("=" * 60)
 
     shutil.rmtree("offline_store", ignore_errors=True)
 
-    fs2 = FeatureStore(timestamp_col="ts")
+    fe2 = FeatureEngine(timestamp_col="ts")
     for f in [user_avg_price, user_tx_count, user_cards_2d]:
-        fs2.register(f)
+        fe2.register(f)
 
     df_sorted = df.sort_values("ts").reset_index(drop=True)
     for _, row in df_sorted.head(5).iterrows():
-        features = fs2.step(row)
+        features = fe2.update(row)
         print(f"  attempt {int(row['attempt_id'])} "
               f"(user {int(row['user_id'])}, ts={row['ts'].date()}) → {features}")
 

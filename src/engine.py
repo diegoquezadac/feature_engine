@@ -1,9 +1,4 @@
-"""Engine - core computation and storage logic.
-
-Handles all the complex machinery: incremental row processing, time-windowed
-aggregations, batch execution, and both online (latest) and offline
-(historical) feature serving.
-"""
+"""FeatureEngine - register features, feed events, get feature values."""
 
 import json
 import os
@@ -27,28 +22,41 @@ logger = logging.getLogger(__name__)
 _VECTORIZABLE_AGGS = frozenset({"mean", "sum", "count", "min", "max", "std", "nunique"})
 
 
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
+class FeatureEngine:
+    """Computes and serves features from event data.
 
+    Define features once, then feed events either one at a time (``update``)
+    or as a full DataFrame (``compute``).  The engine maintains two stores:
 
-class Engine:
-    """Core computation engine for the feature store.
+    - **Online** — in-memory dict of the latest value per entity key.
+      Use ``get_online_features`` for low-latency, real-time lookups.
+    - **Offline** — append-only Parquet directory with the full history of
+      every feature computation.  Never grows unbounded in RAM.
 
-    Maintains an in-memory row buffer and computes features incrementally.
-    The online store (latest values) is kept in memory; the offline store
-    (full history) is persisted to a Parquet file so it never grows
-    unbounded in RAM.
+    Example — streaming::
 
-    The storage layer is injected so it can be swapped for remote or
-    file-backed implementations without touching this class.
+        fe = FeatureEngine(timestamp_col="ts")
+        fe.register(avg_price)
+
+        for _, row in df.iterrows():
+            features = fe.update(row)
+            # {"user": {"avg_price": 120.5}}
+
+    Example — batch::
+
+        fe = FeatureEngine(timestamp_col="ts")
+        fe.register(avg_price)
+
+        report = fe.compute(df)
+        # df now has a new column "user:avg_price"
+        # report → {"rows_processed": 6, "features_computed": 1, ...}
 
     Args:
         timestamp_col: Name of the column used as the event timestamp.
-        offline_path: Path to the Parquet file used by the offline store.
+        offline_path: Directory used by the offline store (Parquet, append-only).
     """
 
-    def __init__(self, timestamp_col: str = "ts", offline_path: str = "offline.parquet"):
+    def __init__(self, timestamp_col: str = "ts", offline_path: str = "offline_store"):
         self.timestamp_col = timestamp_col
         self._features: dict[str, Feature] = {}   # "{entity}:{feature}" → Feature
         self._entities: dict[str, Entity] = {}    # entity_name → Entity
@@ -61,27 +69,31 @@ class Engine:
     # ------------------------------------------------------------------
 
     def register(self, feature: Feature):
-        """Register a feature (and its entity)."""
+        """Register a feature definition."""
         self._features[f"{feature.entity.name}:{feature.name}"] = feature
         self._entities[feature.entity.name] = feature.entity
 
     # ------------------------------------------------------------------
-    # Incremental (streaming) API
+    # Streaming API
     # ------------------------------------------------------------------
 
-    def step(self, row: dict | Any) -> dict[str, dict[str, Any]]:
-        """Process a single row and update the feature stores.
+    def update(self, row: dict | Any) -> dict[str, dict[str, Any]]:
+        """Process one event and return updated feature values.
 
-        The row is appended to the internal buffer.  For every registered
-        feature whose entity key columns are all present in *row*, the
-        feature is recomputed over all buffered rows for that entity (subject
-        to any time window).
+        The row is appended to an internal buffer and every registered feature
+        whose entity key is present in *row* is recomputed over that buffer
+        (subject to any time window).
 
         Args:
             row: A dict or pandas Series representing one event.
 
         Returns:
-            {entity_name: {feature_name: value}} for every entity found in row.
+            ``{entity_name: {feature_name: value}}`` for every entity in row.
+
+        Note:
+            The buffer grows indefinitely. A future improvement is to
+            periodically flush older rows to disk and retain only the rows
+            within the widest registered time window.
         """
         if hasattr(row, "to_dict"):
             row = row.to_dict()
@@ -92,14 +104,9 @@ class Engine:
             )
         self._validate_row(row)
 
-        # NOTE: The buffer grows indefinitely. A future improvement would be to
-        # periodically dump older rows to an optimised data file (e.g. Parquet
-        # or Arrow IPC) and reload only the rows that fall within the widest
-        # registered time window, rather than keeping every row in memory.
         self._buffer.append(row)
         timestamp = row.get(self.timestamp_col)
 
-        # Build a DataFrame from the buffer once per step call.
         df = pd.DataFrame(self._buffer)
 
         updated: dict[str, dict[str, Any]] = {}
@@ -108,7 +115,7 @@ class Engine:
             entity = feature.entity
 
             if entity.key not in row:
-                print(f"[warning] feature '{feature.name}' skipped: key '{entity.key}' not in row")
+                logger.warning("feature '%s' skipped: key '%s' not in row", feature.name, entity.key)
                 continue
 
             entity_key = row[entity.key]
@@ -137,7 +144,7 @@ class Engine:
     # Batch API
     # ------------------------------------------------------------------
 
-    def run(
+    def compute(
         self,
         df: pd.DataFrame,
         verbose: bool = False,
@@ -145,38 +152,36 @@ class Engine:
         checkpoint_dir: str | None = None,
         checkpoint_every: int = 100_000,
     ) -> dict[str, Any]:
-        """Process a full DataFrame in timestamp order, adding computed features
-        as new columns directly on *df*.
+        """Compute features for a full DataFrame, adding results as new columns.
 
-        Unlike ``step()``, this method does **not** use the internal buffer — it
-        works entirely on the supplied DataFrame, which must contain all rows
-        upfront.  The DataFrame is sorted in place by timestamp and feature
-        values are written onto it as new columns named
-        ``"{entity}:{feature}"`` — no copy is made.
+        Sorts *df* in place by timestamp and writes feature values directly
+        onto it as new columns named ``"{entity}:{feature}"``.  Does not use
+        the internal buffer.  Offline records are flushed in 100 K-row batches.
 
-        Offline records are flushed to Parquet in batches of 100 K rows so IO
-        is never a per-row bottleneck.
+        Features split into two execution paths:
+
+        - **Fast** — vectorised ``groupby().expanding()`` ops, one call per
+          feature.  Used when the aggregation is a built-in and there is no
+          time window.
+        - **Slow** — row-by-row with ``searchsorted``.  Used for windowed
+          aggregations and custom callables.  Supports crash recovery via
+          ``checkpoint_dir``.
 
         Args:
             df: Input DataFrame. Must contain ``timestamp_col``. Modified in
-                place — feature values are added as new columns.
-            verbose: When True, emit detailed timing logs via the ``engine``
-                     logger (INFO level). Use ``logging.basicConfig(level=logging.INFO)``
-                     to see them. Defaults to False.
-            log_every: How often (in rows) to emit a progress log when
-                       verbose=True. Defaults to 100.
-            checkpoint_dir: Directory to store checkpoint files.  When set,
-                the slow path saves its progress every ``checkpoint_every``
-                rows so a failed run can resume without restarting from row 0.
-                If a valid checkpoint is found at startup the run resumes
-                automatically; on successful completion the directory is
-                removed.  The fast (vectorised) path always reruns from
-                scratch — it typically takes only seconds.
-            checkpoint_every: How often (in rows) to write a checkpoint
-                during the slow path. Defaults to 100 000.
+                place — feature columns are added directly onto it.
+            verbose: Emit detailed per-phase timing logs (INFO level).
+                     Enable with ``logging.basicConfig(level=logging.INFO)``.
+            log_every: Progress log interval in rows (default 100).
+            checkpoint_dir: Directory for crash-recovery checkpoints saved
+                during the slow path. Pass the same path on a re-run to
+                resume automatically. Deleted on success.
+            checkpoint_every: Rows between checkpoint writes (default 100 000).
 
         Returns:
-            A summary report with execution statistics.
+            A summary report dict with keys: ``rows_processed``,
+            ``features_computed``, ``fast_features``, ``slow_features``,
+            ``records_written``, ``elapsed_seconds``, ``feature_columns``.
         """
         if self.timestamp_col not in df.columns:
             raise ValueError(
@@ -210,7 +215,7 @@ class Engine:
 
         if verbose:
             logger.info(
-                "[run] %d fast features (vectorised), %d slow features (row-by-row)",
+                "[compute] %d fast features (vectorised), %d slow features (row-by-row)",
                 len(fast_feats), len(slow_feats),
             )
 
@@ -232,12 +237,12 @@ class Engine:
                             + [None] * (n_rows - resume_slow_row)
                         )
                 logger.info(
-                    "[run] Resuming from checkpoint — slow row %d/%d",
+                    "[compute] Resuming from checkpoint — slow row %d/%d",
                     resume_slow_row, n_rows,
                 )
             else:
                 logger.warning(
-                    "[run] Checkpoint n_rows mismatch (%d vs %d) — starting fresh",
+                    "[compute] Checkpoint n_rows mismatch (%d vs %d) — starting fresh",
                     _meta.get("n_rows"), n_rows,
                 )
                 resume_slow_row = 0
@@ -316,7 +321,7 @@ class Engine:
         if verbose and fast_feats:
             elapsed = time.perf_counter() - start
             logger.info(
-                "[run] fast path done in %.3fs (%.0f rows/s equivalent) | "
+                "[compute] fast path done in %.3fs (%.0f rows/s equivalent) | "
                 "vectorized=%.3fs records=%.3fs offline_io=%.3fs",
                 elapsed, n_rows / elapsed,
                 _t["vectorized"], _t["records"], _t["offline_io"],
@@ -344,7 +349,7 @@ class Engine:
                         {col: grp[col].to_numpy() for col in input_cols},
                     )
             if verbose:
-                logger.info("[run] slow-path groupby done in %.3fs", time.perf_counter() - _t0)
+                logger.info("[compute] slow-path groupby done in %.3fs", time.perf_counter() - _t0)
 
             windows = {
                 fk: parse_window(feat.window) if feat.window else None
@@ -373,9 +378,9 @@ class Engine:
 
                     if verbose:
                         _t0 = time.perf_counter()
-                    pos        = ts_idx.searchsorted(timestamp, side="right")
-                    window_td  = windows[feat_key]
-                    start_pos  = (
+                    pos       = ts_idx.searchsorted(timestamp, side="right")
+                    window_td = windows[feat_key]
+                    start_pos = (
                         ts_idx.searchsorted(timestamp - window_td, side="left")
                         if window_td is not None else 0
                     )
@@ -432,12 +437,12 @@ class Engine:
                     with open(_ckpt_meta, "w") as _f:
                         json.dump({"n_rows": n_rows, "slow_row": i + 1}, _f)
                     if verbose:
-                        logger.info("[run] Checkpoint saved at row %d/%d", i + 1, n_rows)
+                        logger.info("[compute] Checkpoint saved at row %d/%d", i + 1, n_rows)
 
                 if verbose and (i + 1) % log_every == 0:
                     elapsed = time.perf_counter() - start
                     logger.info(
-                        "[run] slow %d/%d rows (%.0f rows/s) | "
+                        "[compute] slow %d/%d rows (%.0f rows/s) | "
                         "slice=%.3fs where=%.3fs agg=%.3fs online=%.3fs offline_io=%.3fs",
                         i + 1, n_rows, (i + 1) / elapsed,
                         _t["slice"], _t["where"], _t["agg"], _t["online"], _t["offline_io"],
@@ -454,26 +459,26 @@ class Engine:
         if checkpoint_dir and os.path.exists(checkpoint_dir):
             shutil.rmtree(checkpoint_dir)
             if verbose:
-                logger.info("[run] Checkpoint removed — run completed successfully")
+                logger.info("[compute] Checkpoint removed — run completed successfully")
 
         elapsed = time.perf_counter() - start
 
         if verbose:
             total_instrumented = sum(_t.values()) or 1.0
-            logger.info("[run] DONE — %d rows in %.3fs (%.0f rows/s)", n_rows, elapsed, n_rows / elapsed)
-            logger.info("[run] Timing breakdown:")
+            logger.info("[compute] DONE — %d rows in %.3fs (%.0f rows/s)", n_rows, elapsed, n_rows / elapsed)
+            logger.info("[compute] Timing breakdown:")
             for phase, t in _t.items():
                 logger.info("  %-14s  %7.3fs  (%5.1f%%)", phase, t, 100 * t / total_instrumented)
 
         feature_cols = sorted(col_names.values())
         return {
-            "rows_processed":   n_rows,
+            "rows_processed":    n_rows,
             "features_computed": len(self._features),
-            "fast_features":    len(fast_feats),
-            "slow_features":    len(slow_feats),
-            "records_written":  total_records_written,
-            "elapsed_seconds":  round(elapsed, 4),
-            "feature_columns":  feature_cols,
+            "fast_features":     len(fast_feats),
+            "slow_features":     len(slow_feats),
+            "records_written":   total_records_written,
+            "elapsed_seconds":   round(elapsed, 4),
+            "feature_columns":   feature_cols,
         }
 
     # ------------------------------------------------------------------
@@ -481,53 +486,36 @@ class Engine:
     # ------------------------------------------------------------------
 
     def _compute_vectorized(self, df: pd.DataFrame, feature: Feature) -> np.ndarray:
-        """Compute feature values for every row at once using pandas vectorised ops.
-
-        Returns a numpy array aligned with df's integer index (0 … n-1).
-
-        Conditions for calling this:
-          - feature._agg_name is in _VECTORIZABLE_AGGS
-          - feature.window is None
-          - feature.where may or may not be set (handled via NaN masking)
-        """
+        """Compute feature values for every row at once using pandas vectorised ops."""
         ek  = feature.entity.key
         agg = feature._agg_name
         on  = feature.on
 
         if feature.where is not None:
-            # Apply the predicate to the full df — it's a row-wise boolean comparison
-            # so it produces the same mask regardless of whether it sees one entity or all.
             mask = feature.where(df)
             if agg == "count":
-                # Cumulative count of matching rows per entity key.
                 return mask.astype(int).groupby(df[ek]).cumsum().to_numpy()
             else:
-                # Zero out non-matching rows as NaN; expanding agg skips NaN.
                 data = df[on].where(mask, other=np.nan)
                 result = getattr(data.groupby(df[ek]).expanding(), agg)()
                 return result.droplevel(0).sort_index().to_numpy()
 
         if agg == "nunique":
-            # For each row, count distinct (entity_key, value) pairs seen so far.
-            # Mark first occurrence of each pair → cumsum within entity = expanding nunique.
             is_first = (~df.duplicated(subset=[ek, on], keep="first")).astype(int)
             return is_first.groupby(df[ek]).cumsum().to_numpy()
 
         if agg == "count":
             return (df.groupby(ek).cumcount() + 1).to_numpy()
 
-        # mean, sum, min, max, std — expanding window
         result = getattr(df.groupby(ek)[on].expanding(), agg)()
         return result.droplevel(0).sort_index().to_numpy()
 
     # ------------------------------------------------------------------
-    # Querying
+    # Serving
     # ------------------------------------------------------------------
 
-    def get_online_features(
-        self, entity_name: str, **entity_keys
-    ) -> dict[str, Any]:
-        """Return the latest feature values for an entity."""
+    def get_online_features(self, entity_name: str, **entity_keys) -> dict[str, Any]:
+        """Return the latest feature values for an entity key."""
         entity = self._entities.get(entity_name)
         if not entity:
             return {}
@@ -540,7 +528,7 @@ class Engine:
         as_of: datetime | None = None,
         **entity_keys,
     ) -> list[FeatureRecord]:
-        """Return historical feature records for an entity."""
+        """Return historical feature records for an entity key."""
         entity = self._entities.get(entity_name)
         if not entity:
             return []
@@ -548,19 +536,19 @@ class Engine:
         entity_key = entity_keys.get(entity.key)
 
         if feature_name:
-            return self.offline.get_historical(
-                entity_name, entity_key, feature_name, as_of
-            )
+            return self.offline.get_historical(entity_name, entity_key, feature_name, as_of)
 
-        all_features = [
-            f for f in self._features.values() if f.entity.name == entity_name
-        ]
         results: list[FeatureRecord] = []
-        for f in all_features:
-            results.extend(
-                self.offline.get_historical(entity_name, entity_key, f.name, as_of)
-            )
+        for f in self._features.values():
+            if f.entity.name == entity_name:
+                results.extend(
+                    self.offline.get_historical(entity_name, entity_key, f.name, as_of)
+                )
         return sorted(results, key=lambda r: r.timestamp)
+
+    def flush(self):
+        """Flush any buffered offline records to disk immediately."""
+        self.offline.flush()
 
     # ------------------------------------------------------------------
     # Internal helpers
