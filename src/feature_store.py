@@ -84,22 +84,25 @@ class FeatureStore:
     # Batch API
     # ------------------------------------------------------------------
 
-    def run(self, df: pd.DataFrame) -> dict[str, Any]:
+    def run(self, df: pd.DataFrame, verbose: bool = False, log_every: int = 100) -> dict[str, Any]:
         """Process a full DataFrame in timestamp order (experimental mode).
 
         Modifies *df* in place by adding feature values as new columns named
-        ``"{entity}__{feature}"``. All offline records are written in a single
-        batch at the end. Does not use the internal buffer.
+        ``"{entity}__{feature}"``. Offline records are flushed in 100 K-row
+        batches. Does not use the internal buffer.
 
         Args:
             df: Input DataFrame. Must contain ``timestamp_col``. Modified in
                 place — feature columns are added directly onto it.
+            verbose: Emit detailed per-phase timing logs (INFO level).
+                     Enable with ``logging.basicConfig(level=logging.INFO)``.
+            log_every: Progress log interval in rows (default 100).
 
         Returns:
             A summary report dict: rows_processed, features_computed,
             records_written, elapsed_seconds, feature_columns.
         """
-        return self._engine.run(df)
+        return self._engine.run(df, verbose=verbose, log_every=log_every)
 
     # ------------------------------------------------------------------
     # Serving

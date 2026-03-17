@@ -6,6 +6,7 @@ aggregations, batch execution, and both online (latest) and offline
 """
 
 import time
+import logging
 import pandas as pd
 from datetime import datetime
 from typing import Any
@@ -13,6 +14,8 @@ from typing import Any
 from src.entity import Entity
 from src.feature import Feature, parse_window
 from src.storage import OnlineStorage, OfflineStorage, FeatureRecord
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +128,7 @@ class Engine:
     # Batch API
     # ------------------------------------------------------------------
 
-    def run(self, df: pd.DataFrame) -> dict[str, Any]:
+    def run(self, df: pd.DataFrame, verbose: bool = False, log_every: int = 100) -> dict[str, Any]:
         """Process a full DataFrame in timestamp order, adding computed features
         as new columns directly on *df*.
 
@@ -135,12 +138,17 @@ class Engine:
         values are written onto it as new columns named
         ``"{entity}__{feature}"`` — no copy is made.
 
-        All offline records are collected and flushed to Parquet in a single
-        batch write at the end, so IO is not a per-row bottleneck.
+        Offline records are flushed to Parquet in batches of 100 K rows so IO
+        is never a per-row bottleneck.
 
         Args:
             df: Input DataFrame. Must contain ``timestamp_col``. Modified in
                 place — feature values are added as new columns.
+            verbose: When True, emit detailed timing logs via the ``engine``
+                     logger (INFO level). Use ``logging.basicConfig(level=logging.INFO)``
+                     to see them. Defaults to False.
+            log_every: How often (in rows) to emit a progress log when
+                       verbose=True. Defaults to 100.
 
         Returns:
             A summary report with execution statistics.
@@ -150,11 +158,25 @@ class Engine:
                 f"timestamp column '{self.timestamp_col}' not found in DataFrame columns: {list(df.columns)}"
             )
 
-        start = time.time()
+        start = time.perf_counter()
         df.sort_values(self.timestamp_col, inplace=True, ignore_index=True)
 
         _BATCH_SIZE = 100_000
         records: list[FeatureRecord] = []
+        total_records_written = 0
+
+        # Timing accumulators (only populated when verbose=True).
+        _t: dict[str, float] = {
+            "filter": 0.0,   # boolean mask: entity key + timestamp
+            "window": 0.0,   # _apply_window()
+            "where": 0.0,    # feature.where predicate
+            "agg": 0.0,      # feature.aggregation()
+            "online": 0.0,   # online store upsert
+            "df_write": 0.0, # df.at[] cell write
+            "offline_io": 0.0, # batch_write() calls
+        }
+
+        n_rows = len(df)
 
         for i, row in df.iterrows():
             timestamp = row[self.timestamp_col]
@@ -163,22 +185,50 @@ class Engine:
                 entity = feature.entity
 
                 if entity.key not in df.columns:
-                    print(f"[warning] feature '{feature.name}' skipped: key '{entity.key}' not in DataFrame")
+                    logger.warning("feature '%s' skipped: key '%s' not in DataFrame", feature.name, entity.key)
                     continue
 
                 entity_key = row[entity.key]
+
+                if verbose:
+                    _t0 = time.perf_counter()
                 entity_df = df[
                     (df[entity.key] == entity_key) &
                     (df[self.timestamp_col] <= timestamp)
                 ]
+                if verbose:
+                    _t["filter"] += time.perf_counter() - _t0
+
+                if verbose:
+                    _t0 = time.perf_counter()
                 entity_df = self._apply_window(entity_df, feature, timestamp)
+                if verbose:
+                    _t["window"] += time.perf_counter() - _t0
+
                 if feature.where is not None:
+                    if verbose:
+                        _t0 = time.perf_counter()
                     entity_df = entity_df[feature.where(entity_df)]
+                    if verbose:
+                        _t["where"] += time.perf_counter() - _t0
 
+                if verbose:
+                    _t0 = time.perf_counter()
                 value = feature.aggregation(entity_df)
+                if verbose:
+                    _t["agg"] += time.perf_counter() - _t0
 
+                if verbose:
+                    _t0 = time.perf_counter()
                 self.online.upsert(entity.name, entity_key, feature.name, value)
+                if verbose:
+                    _t["online"] += time.perf_counter() - _t0
+
+                if verbose:
+                    _t0 = time.perf_counter()
                 df.at[i, f"{entity.name}__{feature.name}"] = value
+                if verbose:
+                    _t["df_write"] += time.perf_counter() - _t0
 
                 records.append(FeatureRecord(
                     entity_name=entity.name,
@@ -189,20 +239,53 @@ class Engine:
                 ))
 
             if len(records) >= _BATCH_SIZE:
+                if verbose:
+                    _t0 = time.perf_counter()
                 self.offline.batch_write(records)
+                if verbose:
+                    _t["offline_io"] += time.perf_counter() - _t0
+                total_records_written += len(records)
                 records.clear()
 
+            if verbose and (i + 1) % log_every == 0:
+                elapsed = time.perf_counter() - start
+                rows_s = (i + 1) / elapsed
+                logger.info(
+                    "[run] %d/%d rows (%.0f rows/s) | filter=%.3fs window=%.3fs "
+                    "where=%.3fs agg=%.3fs online=%.3fs df_write=%.3fs offline_io=%.3fs",
+                    i + 1, n_rows, rows_s,
+                    _t["filter"], _t["window"], _t["where"],
+                    _t["agg"], _t["online"], _t["df_write"], _t["offline_io"],
+                )
+
         if records:
+            if verbose:
+                _t0 = time.perf_counter()
             self.offline.batch_write(records)
+            if verbose:
+                _t["offline_io"] += time.perf_counter() - _t0
+            total_records_written += len(records)
+
+        elapsed = time.perf_counter() - start
+
+        if verbose:
+            total_instrumented = sum(_t.values()) or 1.0
+            logger.info(
+                "[run] DONE — %d rows in %.3fs (%.0f rows/s)",
+                n_rows, elapsed, n_rows / elapsed,
+            )
+            logger.info("[run] Timing breakdown:")
+            for phase, t in _t.items():
+                logger.info("  %-12s  %7.3fs  (%5.1f%%)", phase, t, 100 * t / total_instrumented)
 
         feature_cols = sorted({
             f"{feat.entity.name}__{feat.name}" for feat in self._features.values()
         })
         return {
-            "rows_processed": len(df),
+            "rows_processed": n_rows,
             "features_computed": len(self._features),
-            "records_written": len(records),
-            "elapsed_seconds": round(time.time() - start, 4),
+            "records_written": total_records_written,
+            "elapsed_seconds": round(elapsed, 4),
             "feature_columns": feature_cols,
         }
 
