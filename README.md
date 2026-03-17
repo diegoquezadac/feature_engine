@@ -1,6 +1,6 @@
 # fstore
 
-A lightweight local feature store for incremental, event-driven feature computation. Define features once, feed events row by row with `step()` or replay a full dataset with `run()`. Supports time-windowed aggregations, online serving (in-memory) and offline history (Parquet). No servers, no infra — just Python.
+A lightweight local feature store for incremental, event-driven feature computation. Define features once, feed events row by row with `step()` or replay a full dataset with `run()`. Supports time-windowed aggregations, row-level filters, online serving (in-memory) and offline history (Parquet).
 
 ## Installation
 
@@ -13,7 +13,7 @@ pip install pandas pyarrow
 | Concept | What it is |
 |---|---|
 | `Entity` | The thing you compute features for (e.g. a user, a merchant). Identified by a single key column. |
-| `Feature` | A named aggregation over an entity's historical rows, optionally within a time window. |
+| `Feature` | A named aggregation over an entity's historical rows, optionally within a time window and/or a row filter. |
 | `FeatureStore` | Orchestrates registration, computation, and serving. Delegates all logic to the `Engine`. |
 
 The store maintains two backends:
@@ -30,11 +30,10 @@ user  = Entity("user",  "user_id")
 store = Entity("store", "store_id")
 
 # 2. Define features
-avg_price    = Feature("avg_price",   user, lambda g: g["price"].mean(), ["price"])
-tx_count     = Feature("tx_count",    user, lambda g: len(g),            [])
-cards_30m    = Feature("cards_30m",   user, lambda g: g["card"].nunique(), ["card"], "30m")
-
-store_rev    = Feature("total_revenue", store, lambda g: g["price"].sum(), ["price"])
+avg_price = Feature("avg_price",    user,  "mean",    on="price")
+tx_count  = Feature("tx_count",     user,  "count")
+cards_30m = Feature("cards_30m",    user,  "nunique", on="card", window="30m")
+store_rev = Feature("total_revenue",store, "sum",     on="price")
 
 # 3. Create store and register features
 fs = FeatureStore(timestamp_col="ts")
@@ -99,16 +98,37 @@ records = fs.get_offline_features("user", feature_name="avg_price",
 ## Feature definition
 
 ```python
-Feature(name, entity, aggregation, columns, window=None)
+Feature(name, entity, aggregation, on=None, window=None, where=None)
 ```
 
 | Parameter | Type | Description |
 |---|---|---|
 | `name` | `str` | Feature name, e.g. `"avg_price"` |
 | `entity` | `Entity` | The entity this feature belongs to |
-| `aggregation` | `Callable` | Function `(DataFrame) -> value`. Receives all historical rows for this entity (within the window, if set). |
-| `columns` | `list[str]` | Columns the aggregation reads. Used for upfront validation. Pass `[]` if no columns are needed (e.g. `len(g)`). |
+| `aggregation` | `str \| Callable` | Built-in name (see table below) or a custom `(DataFrame) -> value` function |
+| `on` | `str \| None` | Column the aggregation reads. Required for all built-ins except `"count"`. For custom callables, used for upfront column validation. |
 | `window` | `str \| None` | Optional time window: `"30m"`, `"2h"`, `"7d"`, etc. Supported units: `s`, `m`, `h`, `d`. |
+| `where` | `Callable \| None` | Optional row filter applied after windowing. Receives the entity DataFrame, must return a boolean Series. |
+
+### Built-in aggregations
+
+| Name | Equivalent |
+|---|---|
+| `"mean"` | `g[col].mean()` |
+| `"sum"` | `g[col].sum()` |
+| `"count"` | `len(g)` |
+| `"nunique"` | `g[col].nunique()` |
+| `"min"` | `g[col].min()` |
+| `"max"` | `g[col].max()` |
+| `"std"` | `g[col].std()` |
+| `"first"` | `g[col].iloc[0]` |
+| `"last"` | `g[col].iloc[-1]` |
+
+For anything else, pass a callable:
+
+```python
+Feature("p95_price", user, lambda g: g["price"].quantile(0.95), on="price")
+```
 
 ### Time windows
 
@@ -116,13 +136,29 @@ When `window` is set, only rows within `[timestamp - window, timestamp]` are pas
 
 ```python
 # Distinct cards used by this user in the last 30 minutes
-cards_30m = Feature("cards_30m", user, lambda g: g["card"].nunique(), ["card"], "30m")
+cards_30m = Feature("cards_30m", user, "nunique", on="card", window="30m")
 
 # Transaction count in the last 7 days
-tx_7d = Feature("tx_7d", user, lambda g: len(g), [], "7d")
+tx_7d = Feature("tx_7d", user, "count", window="7d")
 ```
 
 The window string is validated at construction time — an invalid format raises `ValueError` immediately.
+
+### Row filters
+
+When `where` is set, it is applied after windowing, before the aggregation:
+
+```python
+# Transactions at store 10 only
+tx_store10 = Feature("tx_count_store10", user, "count",
+                     where=lambda g: g["store_id"] == 10)
+
+# Average price of high-value transactions in the last 2 days
+avg_high_2d = Feature("avg_high_price_2d", user, "mean", on="price",
+                      window="2d", where=lambda g: g["price"] > 100)
+```
+
+The predicate receives the full entity DataFrame (already windowed) and has access to any column.
 
 ## Validation
 
@@ -130,7 +166,7 @@ The store validates inputs before doing any work:
 
 - **`step(row)`** — raises `ValueError` if the timestamp column or any declared feature column is missing from the row dict.
 - **`run(df)`** — raises `ValueError` if the timestamp column or `id_col` is missing from the DataFrame columns.
-- **`Feature(...)`** — raises `ValueError` at construction if the `window` string is not a valid format.
+- **`Feature(...)`** — raises `ValueError` at construction if the aggregation name is unknown, if a required `on` column is missing, or if the `window` string is not a valid format.
 - A `[warning]` is printed (but execution continues) when an entity key column is missing from a row — the feature is skipped for that row.
 
 ## Project structure
@@ -138,7 +174,7 @@ The store validates inputs before doing any work:
 ```
 src/
   entity.py        # Entity definition
-  feature.py       # Feature definition + window parsing
+  feature.py       # Feature definition, built-in aggregation registry, window parsing
   feature_store.py # Public interface (thin wrapper over Engine)
   engine.py        # Core computation: step(), run(), serving
   storage.py       # OnlineStorage (in-memory) + OfflineStorage (Parquet)
