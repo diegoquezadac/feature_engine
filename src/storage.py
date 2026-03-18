@@ -203,3 +203,19 @@ class OfflineStorage:
             )
             for row in df.itertuples()
         ]
+
+    def get_latest_values(self) -> pd.DataFrame:
+        """Return the latest value per (entity_name, entity_key, feature_name).
+
+        Returns a DataFrame with columns: entity_name, entity_key, feature_name, value.
+        entity_key values are returned as raw Python objects (JSON-decoded).
+        """
+        self.flush()
+        if not os.path.exists(self.path):
+            return pd.DataFrame(columns=["entity_name", "entity_key", "feature_name", "value"])
+        df = pd.read_parquet(self.path, columns=["entity_name", "entity_key", "feature_name", "value", "timestamp"])
+        df = df.sort_values("timestamp").groupby(
+            ["entity_name", "entity_key", "feature_name"], sort=False
+        ).last().reset_index()
+        df["entity_key"] = df["entity_key"].map(_str_to_key)
+        return df[["entity_name", "entity_key", "feature_name", "value"]]

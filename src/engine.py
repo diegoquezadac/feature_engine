@@ -778,6 +778,23 @@ class FeatureEngine:
         """Flush any buffered offline records to disk immediately."""
         self.offline.flush()
 
+    def restore_online_from_offline(self) -> int:
+        """Populate the online store with the latest values from the offline Parquet backup.
+
+        Reads the latest value per (entity_name, entity_key, feature_name) from
+        every part file in the offline store and upserts them into the in-memory
+        online store.  Safe to call on a fresh engine (no-op if the store is empty).
+
+        Returns:
+            Number of (entity, key, feature) entries loaded.
+        """
+        df = self.offline.get_latest_values()
+        if df.empty:
+            return 0
+        for row in df.itertuples(index=False):
+            self.online.upsert(row.entity_name, row.entity_key, row.feature_name, row.value)
+        return len(df)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
