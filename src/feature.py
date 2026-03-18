@@ -21,6 +21,7 @@ _AGG_REGISTRY: dict[str, Callable] = {
     "std":     lambda col: lambda g: g[col].std(),
     "first":   lambda col: lambda g: g[col].iloc[0] if len(g) else None,
     "last":    lambda col: lambda g: g[col].iloc[-1] if len(g) else None,
+    "mode":    lambda col: lambda g: g[col].mode().iloc[0] if len(g) else None,
 }
 
 # Built-ins that operate on the whole group, not a specific column.
@@ -55,6 +56,7 @@ class Feature:
         on: Column the aggregation reads. Required for all built-ins except
             'count'. For custom callables, used to auto-populate ``columns``
             for validation; omit if the callable needs no columns.
+            For 'mode', this is the column whose most frequent value is returned.
         window: Optional time window string (e.g., '30m', '2h', '7d').
                 When set, only rows within [timestamp - window, timestamp]
                 are passed to the aggregation function.

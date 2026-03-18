@@ -25,6 +25,10 @@ _VECTORIZABLE_AGGS = frozenset({"mean", "sum", "count", "min", "max", "std", "nu
 # Requires: built-in aggregation name and window set. where filters are also supported.
 _WINDOWED_VECTORIZABLE = frozenset({"mean", "sum", "count", "min", "max", "std", "nunique"})
 
+# Built-ins that are always computed entity-by-entity, even without a time window.
+# They can't be vectorised across the whole DataFrame in a single pass.
+_ENTITY_WISE_AGGS = frozenset({"mode"})
+
 # Sentinel object used as dict key for NaN values in the nunique sliding window.
 _NAN_SENTINEL = object()
 
@@ -211,7 +215,7 @@ class FeatureEngine:
         # Split features into three paths:
         #   fast     — vectorised pandas ops over the whole df at once (no Python loop)
         #   windowed — entity-by-entity sliding window, O(n) total (no per-row DataFrame)
-        #              supports where filters via NaN masking before rolling
+        #              also handles _ENTITY_WISE_AGGS (e.g. mode) without a window
         #   slow     — row-by-row with searchsorted (custom callables, first/last with window)
         fast_feats = [
             (fk, feat) for fk, feat in feat_items
@@ -219,12 +223,13 @@ class FeatureEngine:
         ]
         windowed_feats = [
             (fk, feat) for fk, feat in feat_items
-            if feat._agg_name in _WINDOWED_VECTORIZABLE
-            and feat.window is not None
+            if feat._agg_name in _ENTITY_WISE_AGGS  # always entity-by-entity (window optional)
+            or (feat._agg_name in _WINDOWED_VECTORIZABLE and feat.window is not None)
         ]
         slow_feats = [
             (fk, feat) for fk, feat in feat_items
-            if not (feat._agg_name in _VECTORIZABLE_AGGS and feat.window is None)
+            if feat._agg_name not in _ENTITY_WISE_AGGS
+            and not (feat._agg_name in _VECTORIZABLE_AGGS and feat.window is None)
             and not (feat._agg_name in _WINDOWED_VECTORIZABLE and feat.window is not None)
         ]
 
@@ -608,7 +613,60 @@ class FeatureEngine:
         on = feat.on
         agg = feat._agg_name
         ts_col = self.timestamp_col
-        window_td = parse_window(feat.window)
+        window_td = parse_window(feat.window) if feat.window is not None else None
+
+        # ---- mode (cumulative or windowed) ---------------------------------
+        # Returns the most frequent value in the window; result dtype is object
+        # because the column may contain strings or mixed types.
+        if agg == "mode":
+            result = np.empty(len(df), dtype=object)
+            window_ns = (
+                np.timedelta64(int(window_td.total_seconds() * 1e9), "ns")
+                if window_td is not None else None
+            )
+            for _, grp in df.groupby(ek, sort=False, dropna=False):
+                idx = grp.index.to_numpy()
+                ts = grp[ts_col].to_numpy(dtype="datetime64[ns]") if window_ns is not None else None
+                vals_raw = grp[on].to_numpy()
+                vals = [_NAN_SENTINEL if pd.isna(v) else v for v in vals_raw]
+                where_mask = feat.where(grp).to_numpy() if feat.where is not None else None
+
+                counts: dict = {}
+                max_count = 0
+                current_mode_key = _NAN_SENTINEL
+                left = 0
+
+                for right in range(len(idx)):
+                    if where_mask is None or where_mask[right]:
+                        vk = vals[right]
+                        counts[vk] = counts.get(vk, 0) + 1
+                        if counts[vk] > max_count:
+                            max_count = counts[vk]
+                            current_mode_key = vk
+
+                    if window_ns is not None:
+                        cutoff = ts[right] - window_ns
+                        while ts[left] < cutoff:
+                            if where_mask is None or where_mask[left]:
+                                lvk = vals[left]
+                                c = counts[lvk] - 1
+                                if c == 0:
+                                    del counts[lvk]
+                                else:
+                                    counts[lvk] = c
+                            left += 1
+                        # Recompute mode after window shrinks (max_count may be stale).
+                        if counts:
+                            current_mode_key = max(counts, key=counts.get)
+                            max_count = counts[current_mode_key]
+                        else:
+                            current_mode_key = _NAN_SENTINEL
+                            max_count = 0
+
+                    result[idx[right]] = (
+                        None if current_mode_key is _NAN_SENTINEL else current_mode_key
+                    )
+            return result
 
         result = np.empty(len(df), dtype=np.float64)
 
