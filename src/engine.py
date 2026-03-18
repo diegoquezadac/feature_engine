@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 _VECTORIZABLE_AGGS = frozenset({"mean", "sum", "count", "min", "max", "std", "nunique"})
 
 # Built-ins that support the windowed entity-by-entity path (O(n), no per-row DataFrame).
-# Requires: built-in aggregation name, window set, no where filter.
+# Requires: built-in aggregation name and window set. where filters are also supported.
 _WINDOWED_VECTORIZABLE = frozenset({"mean", "sum", "count", "min", "max", "std", "nunique"})
 
 # Sentinel object used as dict key for NaN values in the nunique sliding window.
@@ -211,7 +211,8 @@ class FeatureEngine:
         # Split features into three paths:
         #   fast     — vectorised pandas ops over the whole df at once (no Python loop)
         #   windowed — entity-by-entity sliding window, O(n) total (no per-row DataFrame)
-        #   slow     — row-by-row with searchsorted (custom callables, where+window, first/last)
+        #              supports where filters via NaN masking before rolling
+        #   slow     — row-by-row with searchsorted (custom callables, first/last with window)
         fast_feats = [
             (fk, feat) for fk, feat in feat_items
             if feat._agg_name in _VECTORIZABLE_AGGS and feat.window is None
@@ -220,16 +221,11 @@ class FeatureEngine:
             (fk, feat) for fk, feat in feat_items
             if feat._agg_name in _WINDOWED_VECTORIZABLE
             and feat.window is not None
-            and feat.where is None
         ]
         slow_feats = [
             (fk, feat) for fk, feat in feat_items
             if not (feat._agg_name in _VECTORIZABLE_AGGS and feat.window is None)
-            and not (
-                feat._agg_name in _WINDOWED_VECTORIZABLE
-                and feat.window is not None
-                and feat.where is None
-            )
+            and not (feat._agg_name in _WINDOWED_VECTORIZABLE and feat.window is not None)
         ]
 
         if verbose:
@@ -603,6 +599,10 @@ class FeatureEngine:
         Uses a sliding-window counter dict for ``nunique`` and pandas
         ``DataFrame.rolling`` (Cython-backed) for all other built-ins.
         Neither path allocates a DataFrame per row.
+
+        ``where`` is supported: for ``nunique`` the mask is checked in the
+        inner loop; for other aggs non-matching values are NaN-masked before
+        rolling so ``count``/``sum``/``mean``/etc. naturally ignore them.
         """
         ek = feat.entity.key
         on = feat.on
@@ -620,20 +620,23 @@ class FeatureEngine:
                 # Normalise NA values to a singleton sentinel so they hash correctly.
                 vals_raw = grp[on].to_numpy()
                 vals = [_NAN_SENTINEL if pd.isna(v) else v for v in vals_raw]
+                where_mask = feat.where(grp).to_numpy() if feat.where is not None else None
 
                 counts: dict = {}
                 left = 0
                 for right in range(len(idx)):
-                    vk = vals[right]
-                    counts[vk] = counts.get(vk, 0) + 1
+                    if where_mask is None or where_mask[right]:
+                        vk = vals[right]
+                        counts[vk] = counts.get(vk, 0) + 1
                     cutoff = ts[right] - window_ns
                     while ts[left] < cutoff:
-                        lvk = vals[left]
-                        c = counts[lvk] - 1
-                        if c == 0:
-                            del counts[lvk]
-                        else:
-                            counts[lvk] = c
+                        if where_mask is None or where_mask[left]:
+                            lvk = vals[left]
+                            c = counts[lvk] - 1
+                            if c == 0:
+                                del counts[lvk]
+                            else:
+                                counts[lvk] = c
                         left += 1
                     result[idx[right]] = len(counts)
             return result.astype(np.int64)
@@ -641,12 +644,38 @@ class FeatureEngine:
         # For count/sum/mean/min/max/std: use pandas rolling (Cython-backed).
         for _, grp in df.groupby(ek, sort=False, dropna=False):
             idx = grp.index.to_numpy()
-            rolled = grp.rolling(window=window_td, on=ts_col, min_periods=1)
-            if agg == "count":
-                # ts is never null, so counting it equals counting rows in window.
-                vals = rolled[ts_col].count()
+
+            if feat.where is not None:
+                mask = feat.where(grp)
+                if agg == "count":
+                    # Use 1.0 where mask is True, NaN elsewhere — rolling.count()
+                    # then equals the number of matching rows in the window.
+                    masked = pd.Series(
+                        np.where(mask, 1.0, np.nan), index=grp.index, name="_v"
+                    )
+                    roll_df = pd.DataFrame(
+                        {ts_col: grp[ts_col].values, "_v": masked.values},
+                        index=grp.index,
+                    )
+                    vals = roll_df.rolling(window=window_td, on=ts_col, min_periods=0)["_v"].count()
+                else:
+                    # NaN-mask non-matching values; rolling agg ignores NaN naturally.
+                    masked = grp[on].where(mask)
+                    roll_df = pd.DataFrame(
+                        {ts_col: grp[ts_col].values, on: masked.values},
+                        index=grp.index,
+                    )
+                    vals = getattr(
+                        roll_df.rolling(window=window_td, on=ts_col, min_periods=1)[on], agg
+                    )()
             else:
-                vals = getattr(rolled[on], agg)()
+                rolled = grp.rolling(window=window_td, on=ts_col, min_periods=1)
+                if agg == "count":
+                    # ts is never null, so counting it equals counting rows in window.
+                    vals = rolled[ts_col].count()
+                else:
+                    vals = getattr(rolled[on], agg)()
+
             result[idx] = vals.to_numpy()
 
         return result
